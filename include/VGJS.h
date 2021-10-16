@@ -163,8 +163,21 @@ namespace vgjs {
         thread_id_t         m_id;               //for logging performance
         bool                m_is_function;      //default - this is not a function
         JobPriority         m_job_priority;     //defines the position of the job in the JobQueue
+        uint64_t            m_unique_id;        // unique job id across all JobSystem (0 - not set)
+        std::mutex          m_mutex;            // mutex for `job finished` notification
+        std::condition_variable m_cv;           // cv for `job finished` notification
 
-        Job_base() : m_children{ 0 }, m_parent{ nullptr }, m_thread_index{}, m_type{}, m_id{}, m_is_function{ false }, m_job_priority(JobPriority::HIGH) {}
+        Job_base() :
+            m_children{ 0 },
+            m_parent{ nullptr },
+            m_thread_index{},
+            m_type{},
+            m_id{},
+            m_is_function{ false },
+            m_job_priority{ JobPriority::HIGH },
+            m_unique_id { 0 },
+            m_mutex{},
+            m_cv{} {}
 
         virtual bool resume() = 0;                      //this is the actual work to be done
         void operator() () noexcept {           //wrapper as function operator
@@ -198,6 +211,8 @@ namespace vgjs {
             m_thread_index = thread_index_t{};
             m_type = thread_type_t{};
             m_id = thread_id_t{};
+            m_job_priority = JobPriority::HIGH;
+            m_unique_id = 0;
         }
 
         bool resume() noexcept {    //work is to call the function
@@ -395,6 +410,7 @@ namespace vgjs {
         static inline bool                                  m_logging = false;      ///< if true then jobs will be logged
         static inline std::map<int32_t, std::string>        m_types;                ///<map types to a string for logging
         static inline std::chrono::time_point<std::chrono::high_resolution_clock> m_start_time = std::chrono::high_resolution_clock::now();	//time when program started
+        static inline std::atomic<uint64_t>             m_unique_job_id = 1; //global unique job id (hope it will not overflow)
 
         /**
         * \brief Allocate a job so that it can be scheduled.
@@ -429,7 +445,7 @@ namespace vgjs {
         */
         template <typename F>
         requires FUNCTOR<F>
-        Job* allocate_job(F&& f) noexcept {
+        Job* allocate_job(F&& f) {
             Job* job = allocate_job();
             if constexpr (std::is_same_v<std::decay_t<F>, Function>) {
                 job->m_function     = f.get_function();
@@ -587,6 +603,12 @@ namespace vgjs {
                     auto is_function = m_current_job->is_function();      //save certain info since a coro might be destroyed
 
                     (*m_current_job)();   //if any job found execute it - a coro might be destroyed here!
+
+                    {
+                        std::lock_guard lg{ m_current_job->m_mutex };
+                        m_current_job->m_unique_id = 0;
+                    }
+                    m_current_job->m_cv.notify_one();
 
                     if constexpr (c_enable_logging) {
                         if (is_logging()) {
@@ -793,20 +815,23 @@ namespace vgjs {
 
         /**
         * \brief Schedule a function holding a function into the job system - or a tag
-        * \param[in] function An external function that is copied into the scheduled job.
-        * \param[in] priority job priority.
-        * \param[in] which thread to attach job to.
+        * \param[in] function - An external function that is copied into the scheduled job.
+        * \param[in] priority - job priority.
+        * \param[in] thread_num - which thread to attach job to.
         */
         template<typename F>
         requires FUNCTOR<F>
-        uint32_t schedule(F&& function, JobPriority priority, thread_index_t thread_num) noexcept {
+        std::pair<Job*, uint64_t> schedule(F&& function, JobPriority priority, thread_index_t thread_num) noexcept {
             Job* job = allocate_job(std::forward<F>(function));
             job->m_parent = nullptr;
             job->m_job_priority = priority;
             job->m_thread_index = thread_num;
-            return schedule_job(job, tag_t{});
+            // TODO: use another memory order ?
+            job->m_unique_id = m_unique_job_id.fetch_add(1);
+            uint64_t uid = job->m_unique_id;
+            schedule_job(job, tag_t{});
+            return {job , uid};
         };
-
 
         /**
         * \brief Store a continuation for the current Job. Will be scheduled once the current Job finishes.

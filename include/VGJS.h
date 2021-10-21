@@ -35,14 +35,14 @@
 #include <sstream>
 #include <compare>
 #include <unordered_map>
+#include <format>
+#include <Windows.h>
 
 #include "IntType.h"
 
 #include "RobinTheEngine/Exceptions/JobException.h"
 #include "RobinTheEngine/JobSystem/JobPriority.h"
-
-using namespace std::chrono;
-
+#include "RobinTheEngine/Log.h"
 
 #if(defined(_MSC_VER))
     #include <memory_resource>
@@ -63,6 +63,8 @@ using namespace std::chrono;
 #endif
 
 namespace vgjs {
+
+    using namespace std::chrono;
 
     class Job;
     class Job_base;
@@ -314,9 +316,11 @@ namespace vgjs {
         * \param[in] job The job to be pushed into the queue.
         */
         void push(JOB* job) {
+
             if constexpr (SYNC) {
                 while (m_lock.test_and_set(std::memory_order::acquire));  // acquire lock
             }
+            size_t queue_idx = 0;
             job->m_next = nullptr;      //clear pointer to successor
             if (m_head == nullptr) {    //if queue is empty
                 m_head = job;           //let m_head point to the job
@@ -326,7 +330,7 @@ namespace vgjs {
                 // It is not guaranteed, that JOB will have m_job_priority member, but it is ok for our case
                 JOB *cur = m_head;
                 JOB *prev = nullptr;
-                for (; cur; prev = cur, cur = static_cast<JOB*>(cur->m_next) ) {
+                for (; cur; prev = cur, cur = static_cast<JOB*>(cur->m_next), queue_idx++) {
                     if (cur->m_job_priority < job->m_job_priority) { // found place to insert job
                         break;
                     }
@@ -346,6 +350,7 @@ namespace vgjs {
             }
 
             m_size++;                   //increase size
+            RTE::Log::GetCoreLogger()->trace(std::format("New job added, number in the queue: {}, queue size: {}", queue_idx, m_size));
             if constexpr (SYNC) {
                 m_lock.clear(std::memory_order::release); //release lock
             }
@@ -426,8 +431,7 @@ namespace vgjs {
                 n_pmr::polymorphic_allocator<Job> allocator(m_mr);      //use this allocator
                 job = allocator.allocate(1);                            //allocate the object
                 if (job == nullptr) {
-                    // TODO: replace with logger ?
-                    std::cout << "No job available\n";
+                    RTE::Log::GetCoreLogger()->trace("No job available");
                     throw RTE::JobException("Job system can't allocate new job");
                 }
                 new (job) Job(m_mr);                 //call constructor
@@ -465,8 +469,7 @@ namespace vgjs {
             }
 
             if (!job->m_function && !job->m_pfvoid) {
-                // TODO: replace with logger ?
-                std::cout << "Empty function\n";
+                RTE::Log::GetCoreLogger()->trace("Empty function");
                 throw RTE::JobException("Job do not have function to execute");
             }
             return job;
@@ -494,13 +497,14 @@ namespace vgjs {
             m_terminated = false;
 
             m_thread_count = threadCount.value;
+            int hardware_threads = std::thread::hardware_concurrency();
             if (m_thread_count <= 0) {
-                m_thread_count = std::thread::hardware_concurrency();		///< main thread is also running
+                m_thread_count = hardware_threads;		///< main thread is also running
             }
             if (m_thread_count == 0) {
                 m_thread_count = 2;  // we want at least 2 threads
             }
-
+            RTE::Log::GetCoreLogger()->trace(std::format("Number of threads created: {}, hardware number of threads: {}", m_thread_count.load(), hardware_threads));
             for (uint32_t i = 0; i < m_thread_count; i++) {
                 m_global_queues.push_back(JobQueue<Job_base>());     //global job queue
                 m_local_queues.push_back(JobQueue<Job_base>());     //local job queue
@@ -511,6 +515,7 @@ namespace vgjs {
             for (uint32_t i = start_idx.value; i < m_thread_count; i++) {
                 //std::cout << "Starting thread " << i << std::endl;
                 m_threads.push_back(std::thread(&JobSystem::thread_task, this, thread_index_t(i) ));	//spawn the pool threads
+                SetThreadAffinityMask(m_threads[i].native_handle(), 1ll << (i % hardware_threads));
                 m_threads[i].detach();
             }
 
@@ -569,6 +574,11 @@ namespace vgjs {
             m_thread_index = threadIndex;	                                //Remember your own thread index number
             static std::atomic<uint32_t> thread_counter = m_thread_count.load();	//Counted down when started
 
+            HRESULT coinited = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            if (coinited == S_FALSE) {
+                RTE::Log::GetCoreLogger()->error(std::format("Thread {} can't use COM library functions", m_thread_index.value));
+            }
+
             thread_counter--;			                                    //count down
             while (thread_counter.load() > 0) {}	                        //Continue only if all threads are running
 
@@ -601,8 +611,9 @@ namespace vgjs {
                         id = m_current_job->m_id;
                     }
                     auto is_function = m_current_job->is_function();      //save certain info since a coro might be destroyed
-
+                    RTE::Log::GetCoreLogger()->trace(std::format("Starting job with id {} on thread {}", m_current_job->m_unique_id, m_thread_index.value));
                     (*m_current_job)();   //if any job found execute it - a coro might be destroyed here!
+                    RTE::Log::GetCoreLogger()->trace(std::format("Job with id {} finished on thread {}", m_current_job->m_unique_id, m_thread_index.value));
 
                     {
                         std::lock_guard lg{ m_current_job->m_mutex };
@@ -624,12 +635,14 @@ namespace vgjs {
                 }
                 else if (++noop_counter > NOOP) [[unlikely]] {   //if none found too longs let thread sleep
                     m_delete.clear();       //delete jobs to reclaim memory
-                    // why always waiting on the thread 0 ?
-                    m_cv[0]->wait_for(lk, std::chrono::microseconds(100));
-                    //m_cv[m_thread_index.value]->wait_for(lk, std::chrono::microseconds(100));
+                    m_cv[m_thread_index.value]->wait_for(lk, std::chrono::microseconds(100));
                     noop_counter = noop_counter / 2;
                 }
             };
+
+            if (coinited == S_OK) {
+                CoUninitialize();
+            }
 
            //std::cout << "Thread " << m_thread_index.value << " left " << m_thread_count.load() << "\n";
 

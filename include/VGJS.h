@@ -35,11 +35,14 @@
 #include <sstream>
 #include <compare>
 #include <unordered_map>
+#include <format>
+#include <Windows.h>
 
 #include "IntType.h"
 
-using namespace std::chrono;
-
+#include "RobinTheEngine/Exceptions/JobException.h"
+#include "RobinTheEngine/JobSystem/JobPriority.h"
+#include "RobinTheEngine/Log.h"
 
 #if(defined(_MSC_VER))
     #include <memory_resource>
@@ -59,8 +62,9 @@ using namespace std::chrono;
 #else
 #endif
 
-
 namespace vgjs {
+
+    using namespace std::chrono;
 
     class Job;
     class Job_base;
@@ -72,6 +76,7 @@ namespace vgjs {
     using thread_count_t = int_type<int, struct P3, -1>;
     using tag_t = int_type<int, struct P4, -1>;
     using parent_t = int_type<int, struct P5, -1>;
+    using RTE::JobPriority;
 
     bool is_logging();
     void log_data(  std::chrono::high_resolution_clock::time_point& t1
@@ -159,8 +164,22 @@ namespace vgjs {
         thread_type_t       m_type;             //for logging performance
         thread_id_t         m_id;               //for logging performance
         bool                m_is_function;      //default - this is not a function
+        JobPriority         m_job_priority;     //defines the position of the job in the JobQueue
+        uint64_t            m_unique_id;        // unique job id across all JobSystem (0 - not set)
+        std::mutex          m_mutex;            // mutex for `job finished` notification
+        std::condition_variable m_cv;           // cv for `job finished` notification
 
-        Job_base() : m_children{ 0 }, m_parent{ nullptr }, m_thread_index{}, m_type{}, m_id{}, m_is_function{ false } {}
+        Job_base() :
+            m_children{ 0 },
+            m_parent{ nullptr },
+            m_thread_index{},
+            m_type{},
+            m_id{},
+            m_is_function{ false },
+            m_job_priority{ JobPriority::HIGH },
+            m_unique_id { 0 },
+            m_mutex{},
+            m_cv{} {}
 
         virtual bool resume() = 0;                      //this is the actual work to be done
         void operator() () noexcept {           //wrapper as function operator
@@ -194,6 +213,8 @@ namespace vgjs {
             m_thread_index = thread_index_t{};
             m_type = thread_type_t{};
             m_id = thread_id_t{};
+            m_job_priority = JobPriority::HIGH;
+            m_unique_id = 0;
         }
 
         bool resume() noexcept {    //work is to call the function
@@ -295,22 +316,41 @@ namespace vgjs {
         * \param[in] job The job to be pushed into the queue.
         */
         void push(JOB* job) {
+
             if constexpr (SYNC) {
                 while (m_lock.test_and_set(std::memory_order::acquire));  // acquire lock
             }
+            size_t queue_idx = 0;
             job->m_next = nullptr;      //clear pointer to successor
             if (m_head == nullptr) {    //if queue is empty
                 m_head = job;           //let m_head point to the job
-            }
-            if (m_tail == nullptr) {    //if queue was empty
                 m_tail = job;           //let m_tail point to the job
             }
             else {
-                m_tail->m_next = (JOB*)job;   //add the job to the queue tail
-                m_tail = job;           //m_tail points to the new job
+                // It is not guaranteed, that JOB will have m_job_priority member, but it is ok for our case
+                JOB *cur = m_head;
+                JOB *prev = nullptr;
+                for (; cur; prev = cur, cur = static_cast<JOB*>(cur->m_next), queue_idx++) {
+                    if (cur->m_job_priority < job->m_job_priority) { // found place to insert job
+                        break;
+                    }
+                }
+                if (cur && prev) { // somewhere in the middle of the queue
+                    job->m_next = cur;
+                    prev->m_next = job;
+                }
+                if (cur == nullptr) { // current job have lowest priority, add to the end of the queue
+                    m_tail->m_next = job;
+                    m_tail = job;
+                }
+                if (prev == nullptr) { // current job has highest priority, add to the head of the queue
+                    job->m_next = m_head;
+                    m_head = job;
+                }
             }
 
             m_size++;                   //increase size
+            RTE::Log::GetCoreLogger()->trace(std::format("New job added, number in the queue: {}, queue size: {}", queue_idx, m_size));
             if constexpr (SYNC) {
                 m_lock.clear(std::memory_order::release); //release lock
             }
@@ -375,6 +415,7 @@ namespace vgjs {
         static inline bool                                  m_logging = false;      ///< if true then jobs will be logged
         static inline std::map<int32_t, std::string>        m_types;                ///<map types to a string for logging
         static inline std::chrono::time_point<std::chrono::high_resolution_clock> m_start_time = std::chrono::high_resolution_clock::now();	//time when program started
+        static inline std::atomic<uint64_t>             m_unique_job_id = 1; //global unique job id (hope it will not overflow)
 
         /**
         * \brief Allocate a job so that it can be scheduled.
@@ -390,8 +431,8 @@ namespace vgjs {
                 n_pmr::polymorphic_allocator<Job> allocator(m_mr);      //use this allocator
                 job = allocator.allocate(1);                            //allocate the object
                 if (job == nullptr) {
-                    std::cout << "No job available\n";
-                    std::terminate();
+                    RTE::Log::GetCoreLogger()->trace("No job available");
+                    throw RTE::JobException("Job system can't allocate new job");
                 }
                 new (job) Job(m_mr);                 //call constructor
             }
@@ -408,7 +449,7 @@ namespace vgjs {
         */
         template <typename F>
         requires FUNCTOR<F>
-        Job* allocate_job(F&& f) noexcept {
+        Job* allocate_job(F&& f) {
             Job* job = allocate_job();
             if constexpr (std::is_same_v<std::decay_t<F>, Function>) {
                 job->m_function     = f.get_function();
@@ -428,8 +469,8 @@ namespace vgjs {
             }
 
             if (!job->m_function && !job->m_pfvoid) {
-                std::cout << "Empty function\n";
-                std::terminate();
+                RTE::Log::GetCoreLogger()->trace("Empty function");
+                throw RTE::JobException("Job do not have function to execute");
             }
             return job;
         }
@@ -456,13 +497,14 @@ namespace vgjs {
             m_terminated = false;
 
             m_thread_count = threadCount.value;
+            int hardware_threads = std::thread::hardware_concurrency();
             if (m_thread_count <= 0) {
-                m_thread_count = std::thread::hardware_concurrency();		///< main thread is also running
+                m_thread_count = hardware_threads;		///< main thread is also running
             }
             if (m_thread_count == 0) {
-                m_thread_count = 1;
+                m_thread_count = 2;  // we want at least 2 threads
             }
-
+            RTE::Log::GetCoreLogger()->trace(std::format("Number of threads created: {}, hardware number of threads: {}", m_thread_count.load(), hardware_threads));
             for (uint32_t i = 0; i < m_thread_count; i++) {
                 m_global_queues.push_back(JobQueue<Job_base>());     //global job queue
                 m_local_queues.push_back(JobQueue<Job_base>());     //local job queue
@@ -473,6 +515,7 @@ namespace vgjs {
             for (uint32_t i = start_idx.value; i < m_thread_count; i++) {
                 //std::cout << "Starting thread " << i << std::endl;
                 m_threads.push_back(std::thread(&JobSystem::thread_task, this, thread_index_t(i) ));	//spawn the pool threads
+                SetThreadAffinityMask(m_threads[i].native_handle(), 1ll << (i % hardware_threads));
                 m_threads[i].detach();
             }
 
@@ -531,6 +574,11 @@ namespace vgjs {
             m_thread_index = threadIndex;	                                //Remember your own thread index number
             static std::atomic<uint32_t> thread_counter = m_thread_count.load();	//Counted down when started
 
+            HRESULT coinited = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            if (coinited == S_FALSE) {
+                RTE::Log::GetCoreLogger()->error(std::format("Thread {} can't use COM library functions", m_thread_index.value));
+            }
+
             thread_counter--;			                                    //count down
             while (thread_counter.load() > 0) {}	                        //Continue only if all threads are running
 
@@ -563,8 +611,15 @@ namespace vgjs {
                         id = m_current_job->m_id;
                     }
                     auto is_function = m_current_job->is_function();      //save certain info since a coro might be destroyed
-
+                    RTE::Log::GetCoreLogger()->trace(std::format("Starting job with id {} on thread {}", m_current_job->m_unique_id, m_thread_index.value));
                     (*m_current_job)();   //if any job found execute it - a coro might be destroyed here!
+                    RTE::Log::GetCoreLogger()->trace(std::format("Job with id {} finished on thread {}", m_current_job->m_unique_id, m_thread_index.value));
+
+                    {
+                        std::lock_guard lg{ m_current_job->m_mutex };
+                        m_current_job->m_unique_id = 0;
+                    }
+                    m_current_job->m_cv.notify_one();
 
                     if constexpr (c_enable_logging) {
                         if (is_logging()) {
@@ -579,12 +634,15 @@ namespace vgjs {
                     noop_counter = 0;
                 }
                 else if (++noop_counter > NOOP) [[unlikely]] {   //if none found too longs let thread sleep
-                    m_delete.clear();       //delete jobs to reclaim memory                  
-                    m_cv[0]->wait_for(lk, std::chrono::microseconds(100));
-                    //m_cv[m_thread_index.value]->wait_for(lk, std::chrono::microseconds(100));
+                    m_delete.clear();       //delete jobs to reclaim memory
+                    m_cv[m_thread_index.value]->wait_for(lk, std::chrono::microseconds(100));
                     noop_counter = noop_counter / 2;
                 }
             };
+
+            if (coinited == S_OK) {
+                CoUninitialize();
+            }
 
            //std::cout << "Thread " << m_thread_index.value << " left " << m_thread_count.load() << "\n";
 
@@ -592,6 +650,7 @@ namespace vgjs {
            m_local_queues[m_thread_index.value].clear();  //clear your local queue
 
            uint32_t num = m_thread_count.fetch_sub(1);  //last thread clears recycle and garbage queues
+           // TODO: should be moved under condition ?
            m_recycle.clear();
            m_delete.clear();
 
@@ -662,7 +721,7 @@ namespace vgjs {
         * \brief Get the number of threads in the system.
         * \returns the number of threads in the system.
         */
-        thread_count_t get_thread_count() {
+        thread_count_t get_thread_count() const {
             return thread_count_t( m_thread_count.load() );
         }
 
@@ -767,6 +826,25 @@ namespace vgjs {
             }
         };
 
+        /**
+        * \brief Schedule a function holding a function into the job system - or a tag
+        * \param[in] function - An external function that is copied into the scheduled job.
+        * \param[in] priority - job priority.
+        * \param[in] thread_num - which thread to attach job to.
+        */
+        template<typename F>
+        requires FUNCTOR<F>
+        std::pair<Job*, uint64_t> schedule(F&& function, JobPriority priority, thread_index_t thread_num) noexcept {
+            Job* job = allocate_job(std::forward<F>(function));
+            job->m_parent = nullptr;
+            job->m_job_priority = priority;
+            job->m_thread_index = thread_num;
+            // TODO: use another memory order ?
+            job->m_unique_id = m_unique_job_id.fetch_add(1);
+            uint64_t uid = job->m_unique_id;
+            schedule_job(job, tag_t{});
+            return {job , uid};
+        };
 
         /**
         * \brief Store a continuation for the current Job. Will be scheduled once the current Job finishes.

@@ -263,7 +263,7 @@ namespace vgjs {
     * The queue allows for multiple producers multiple consumers. It uses a lightweight
     * atomic flag as lock.
     */
-    template<typename JOB = Queuable, bool SYNC = true>
+    template<typename JOB = Queuable, bool SYNC = true, bool WORKER_QUEUE = true>
     requires std::is_base_of_v<Queuable, JOB >
     class JobQueue {
         friend JobSystem;
@@ -271,7 +271,7 @@ namespace vgjs {
         JOB*             m_head = nullptr;	        //points to first entry
         JOB*             m_tail = nullptr;	        //points to last entry
         int32_t          m_size = 0;                 //number of entries in the queue
-
+        int32_t          m_thread_number = -1;
     public:
 
         JobQueue() noexcept : m_head(nullptr), m_tail(nullptr), m_size(0) {};	///<JobQueue class constructor
@@ -295,6 +295,10 @@ namespace vgjs {
         }
 
         ~JobQueue() {}  //destructor
+
+        void setThreadNumber(size_t thread_number) {
+            m_thread_number = thread_number;
+        }
 
         /**
         * \brief Get the number of jobs currently in the queue.
@@ -350,7 +354,14 @@ namespace vgjs {
             }
 
             m_size++;                   //increase size
-            RTE::Log::GetCoreLogger()->trace(std::format("New job added, number in the queue: {}, queue size: {}", queue_idx, m_size));
+            if constexpr (WORKER_QUEUE) {
+                RTE::Log::GetCoreLogger()->trace(
+                    std::format(
+                        "New job added to thread {}, number in the queue: {}, queue size: {}",
+                        m_thread_number, queue_idx, m_size
+                    )
+                );
+            }
             if constexpr (SYNC) {
                 m_lock.clear(std::memory_order::release); //release lock
             }
@@ -409,8 +420,8 @@ namespace vgjs {
         static inline std::vector<std::unique_ptr<std::condition_variable>>                     m_cv;
         static inline std::vector<std::unique_ptr<std::mutex>>                                  m_mutex;
         static inline std::unordered_map<tag_t,std::unique_ptr<JobQueue<Job_base>>,tag_t::hash> m_tag_queues;
-        static inline thread_local JobQueue<Job,false>      m_recycle;        ///<save old jobs for recycling
-        static inline thread_local JobQueue<Job,false>      m_delete;         ///<save old jobs for deleting
+        static inline thread_local JobQueue<Job,false,false>      m_recycle;        ///<save old jobs for recycling
+        static inline thread_local JobQueue<Job,false,false>      m_delete;         ///<save old jobs for deleting
         static inline n_pmr::vector<n_pmr::vector<JobLog>>	m_logs;				    ///< log the start and stop times of jobs
         static inline bool                                  m_logging = false;      ///< if true then jobs will be logged
         static inline std::map<int32_t, std::string>        m_types;                ///<map types to a string for logging
@@ -497,14 +508,22 @@ namespace vgjs {
             m_terminated = false;
 
             m_thread_count = threadCount.value;
-            int hardware_threads = std::thread::hardware_concurrency();
+            // we want at least 2 threads
+            int hardware_threads = std::max(std::thread::hardware_concurrency(), 2u);
             if (m_thread_count <= 0) {
                 m_thread_count = hardware_threads;		///< main thread is also running
             }
-            if (m_thread_count == 0) {
-                m_thread_count = 2;  // we want at least 2 threads
+            if (m_start_idx + 2 > hardware_threads) {
+                m_start_idx = 0;
+                RTE::Log::GetCoreLogger()->trace("start_idx parameter ignored - not enough hardware concurrency");
             }
-            RTE::Log::GetCoreLogger()->trace(std::format("Number of threads created: {}, hardware number of threads: {}", m_thread_count.load(), hardware_threads));
+            m_thread_count -= m_start_idx; // do not create threads which we should skip
+
+            RTE::Log::GetCoreLogger()->trace(
+                std::format("Number of threads created: {}, hardware number of threads: {}",
+                    m_thread_count.load(), hardware_threads
+                )
+            );
             for (uint32_t i = 0; i < m_thread_count; i++) {
                 m_global_queues.push_back(JobQueue<Job_base>());     //global job queue
                 m_local_queues.push_back(JobQueue<Job_base>());     //local job queue
@@ -512,10 +531,11 @@ namespace vgjs {
                 m_mutex.emplace_back(std::make_unique<std::mutex>());
             }
 
-            for (uint32_t i = start_idx.value; i < m_thread_count; i++) {
-                //std::cout << "Starting thread " << i << std::endl;
-                m_threads.push_back(std::thread(&JobSystem::thread_task, this, thread_index_t(i) ));	//spawn the pool threads
-                SetThreadAffinityMask(m_threads[i].native_handle(), 1ll << (i % hardware_threads));
+            for (uint32_t i = 0; i < m_thread_count; i++) {
+                m_threads.emplace_back(std::thread(&JobSystem::thread_task, this, thread_index_t(i))); //spawn the pool threads
+                // do not bind to threads less then start_idx
+                uint32_t affinity_mask = 1ll << ((i % (hardware_threads - start_idx)) + start_idx); // map thread to [start_idx, hardware_concurrency -1] (affinity starts from 0)
+                SetThreadAffinityMask(m_threads[i].native_handle(), affinity_mask);
                 m_threads[i].detach();
             }
 
@@ -573,6 +593,9 @@ namespace vgjs {
             thread_local static uint32_t noop_counter = 0;
             m_thread_index = threadIndex;	                                //Remember your own thread index number
             static std::atomic<uint32_t> thread_counter = m_thread_count.load();	//Counted down when started
+
+            m_global_queues[m_thread_index.value].setThreadNumber(threadIndex);
+            m_local_queues[m_thread_index.value].setThreadNumber(threadIndex);
 
             HRESULT coinited = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             if (coinited == S_FALSE) {
@@ -650,7 +673,7 @@ namespace vgjs {
            m_local_queues[m_thread_index.value].clear();  //clear your local queue
 
            uint32_t num = m_thread_count.fetch_sub(1);  //last thread clears recycle and garbage queues
-           // TODO: should be moved under condition ?
+
            m_recycle.clear();
            m_delete.clear();
 

@@ -37,6 +37,7 @@
 #include <unordered_map>
 #include <format>
 #include <Windows.h>
+#include <combaseapi.h>
 
 #include "IntType.h"
 

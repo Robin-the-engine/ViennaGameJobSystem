@@ -78,6 +78,7 @@ namespace vgjs {
     using tag_t = int_type<int, struct P4, -1>;
     using parent_t = int_type<int, struct P5, -1>;
     using RTE::JobPriority;
+    using RTE::Log;
 
     bool is_logging();
     void log_data(  std::chrono::high_resolution_clock::time_point& t1
@@ -273,6 +274,7 @@ namespace vgjs {
         JOB*             m_tail = nullptr;	        //points to last entry
         int32_t          m_size = 0;                 //number of entries in the queue
         int32_t          m_thread_number = -1;
+        Log::SPloggerT   logger = Log::GetLogger("JobSystem");
     public:
 
         JobQueue() noexcept : m_head(nullptr), m_tail(nullptr), m_size(0) {};	///<JobQueue class constructor
@@ -356,12 +358,10 @@ namespace vgjs {
 
             m_size++;                   //increase size
             if constexpr (WORKER_QUEUE) {
-                RTE::Log::GetCoreLogger()->trace(
-                    std::format(
-                        "New job added to thread {}, number in the queue: {}, queue size: {}",
-                        m_thread_number, queue_idx, m_size
-                    )
-                );
+                logger->trace(std::format(
+                    "New job added to thread {}, number in the queue: {}, queue size: {}",
+                    m_thread_number, queue_idx, m_size
+                ));
             }
             if constexpr (SYNC) {
                 m_lock.clear(std::memory_order::release); //release lock
@@ -428,7 +428,7 @@ namespace vgjs {
         static inline std::map<int32_t, std::string>        m_types;                ///<map types to a string for logging
         static inline std::chrono::time_point<std::chrono::high_resolution_clock> m_start_time = std::chrono::high_resolution_clock::now();	//time when program started
         static inline std::atomic<uint64_t>             m_unique_job_id = 1; //global unique job id (hope it will not overflow)
-
+        Log::SPloggerT logger = Log::GetLogger("JobSystem");
         /**
         * \brief Allocate a job so that it can be scheduled.
         *
@@ -443,7 +443,7 @@ namespace vgjs {
                 n_pmr::polymorphic_allocator<Job> allocator(m_mr);      //use this allocator
                 job = allocator.allocate(1);                            //allocate the object
                 if (job == nullptr) {
-                    RTE::Log::GetCoreLogger()->trace("No job available");
+                    logger->trace("No job available");
                     throw RTE::JobException("Job system can't allocate new job");
                 }
                 new (job) Job(m_mr);                 //call constructor
@@ -481,7 +481,7 @@ namespace vgjs {
             }
 
             if (!job->m_function && !job->m_pfvoid) {
-                RTE::Log::GetCoreLogger()->trace("Empty function");
+                logger->trace("Empty function");
                 throw RTE::JobException("Job do not have function to execute");
             }
             return job;
@@ -516,11 +516,11 @@ namespace vgjs {
             }
             if (m_start_idx + 2 > hardware_threads) {
                 m_start_idx = 0;
-                RTE::Log::GetCoreLogger()->trace("start_idx parameter ignored - not enough hardware concurrency");
+                logger->trace("start_idx parameter ignored - not enough hardware concurrency");
             }
             m_thread_count -= m_start_idx; // do not create threads which we should skip
 
-            RTE::Log::GetCoreLogger()->trace(
+            logger->trace(
                 std::format("Number of threads created: {}, hardware number of threads: {}",
                     m_thread_count.load(), hardware_threads
                 )
@@ -600,7 +600,7 @@ namespace vgjs {
 
             HRESULT coinited = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             if (coinited == S_FALSE) {
-                RTE::Log::GetCoreLogger()->error(std::format("Thread {} can't use COM library functions", m_thread_index.value));
+                logger->error(std::format("Thread {} can't use COM library functions", m_thread_index.value));
             }
 
             thread_counter--;			                                    //count down
@@ -635,9 +635,9 @@ namespace vgjs {
                         id = m_current_job->m_id;
                     }
                     auto is_function = m_current_job->is_function();      //save certain info since a coro might be destroyed
-                    RTE::Log::GetCoreLogger()->trace(std::format("Starting job with id {} on thread {}", m_current_job->m_unique_id, m_thread_index.value));
+                    logger->trace(std::format("Starting job with id {} on thread {}", m_current_job->m_unique_id, m_thread_index.value));
                     (*m_current_job)();   //if any job found execute it - a coro might be destroyed here!
-                    RTE::Log::GetCoreLogger()->trace(std::format("Job with id {} finished on thread {}", m_current_job->m_unique_id, m_thread_index.value));
+                    logger->trace(std::format("Job with id {} finished on thread {}", m_current_job->m_unique_id, m_thread_index.value));
 
                     {
                         std::lock_guard lg{ m_current_job->m_mutex };
